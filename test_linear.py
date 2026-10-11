@@ -1,7 +1,7 @@
 import os
-import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "10.3.0")
 os.environ.setdefault("PYTORCH_ROCM_ARCH", "gfx1030")
@@ -11,87 +11,86 @@ from dp4a_linear import DP4ALinear
 
 ext = load_ext()
 
-# -------------------------------------------------------------
-# ТЕСТ 1: Квадратная матрица 4096x4096
-# -------------------------------------------------------------
+def print_metrics(name, out_test, out_ref):
+    l2_err = (torch.linalg.vector_norm(out_test - out_ref) / torch.linalg.vector_norm(out_ref)).item()
+    cos_sim = F.cosine_similarity(out_test.flatten(), out_ref.flatten(), dim=0).item()
+    max_err = (out_test - out_ref).abs().max().item()
+    print(f"[{name}]")
+    print(f"  • Относительная L2-ошибка:   {l2_err:.6f} ({l2_err*100:.3f}%)")
+    print(f"  • Cosine Similarity (сходство): {cos_sim:.6f} (идеал = 1.0)")
+    print(f"  • Макс. абсолютная ошибка:     {max_err:.6f}")
+
+# -----------------------------------------------------------------
+# 1. ТЕСТ 4096x4096
+# -----------------------------------------------------------------
 size = 4096
 iters = 20
-
 linear_fp32 = nn.Linear(size, size, bias=True).cuda()
 linear_fp16 = nn.Linear(size, size, bias=True).half().cuda()
 linear_dp4a = DP4ALinear(linear_fp32, ext)
 
-x_fp32 = torch.randn(size, size, device="cuda", dtype=torch.float32)
-x_fp16 = x_fp32.half()
+x = torch.randn(size, size, device="cuda", dtype=torch.float32)
 
 with torch.inference_mode():
     for _ in range(10):
-        _ = linear_fp32(x_fp32)
-        _ = linear_fp16(x_fp16)
-        _ = linear_dp4a(x_fp32)
+        _ = linear_fp32(x)
+        _ = linear_fp16(x.half())
+        _ = linear_dp4a(x)
     torch.cuda.synchronize()
 
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
 
-    start_event.record()
-    for _ in range(iters):
-        _ = linear_fp32(x_fp32)
-    end_event.record()
-    torch.cuda.synchronize()
-    fp32_ms = start_event.elapsed_time(end_event) / iters
+    start.record()
+    for _ in range(iters): _ = linear_fp32(x)
+    end.record(); torch.cuda.synchronize()
+    fp32_ms = start.elapsed_time(end) / iters
 
-    start_event.record()
-    for _ in range(iters):
-        _ = linear_fp16(x_fp16)
-    end_event.record()
-    torch.cuda.synchronize()
-    fp16_ms = start_event.elapsed_time(end_event) / iters
+    start.record()
+    for _ in range(iters): _ = linear_fp16(x.half())
+    end.record(); torch.cuda.synchronize()
+    fp16_ms = start.elapsed_time(end) / iters
 
-    start_event.record()
-    for _ in range(iters):
-        _ = linear_dp4a(x_fp32)
-    end_event.record()
-    torch.cuda.synchronize()
-    dp4a_ms = start_event.elapsed_time(end_event) / iters
-
-    out_fp32 = linear_fp32(x_fp32)
-    out_dp4a = linear_dp4a(x_fp32)
-    error_4096 = (torch.linalg.vector_norm(out_dp4a - out_fp32) / torch.linalg.vector_norm(out_fp32)).item()
+    start.record()
+    for _ in range(iters): _ = linear_dp4a(x)
+    end.record(); torch.cuda.synchronize()
+    dp4a_ms = start.elapsed_time(end) / iters
 
 print("\n" + "="*65)
-print(f" ТЕСТ 1: КВАДРАТНАЯ МАТРИЦА ({size}x{size})")
+print(f" РЕЗУЛЬТАТЫ СЛОЯ 4096x4096 (Медиана 20 итераций)")
 print("="*65)
-print(f"torch.nn.Linear (FP32 rocBLAS): {fp32_ms:.3f} ms")
-print(f"torch.nn.Linear (FP16 rocBLAS): {fp16_ms:.3f} ms")
-print(f"DP4ALinear (FUSED EPILOGUE):    {dp4a_ms:.3f} ms")
-print(f"Ускорение относительно FP32:   {fp32_ms / dp4a_ms:.3f}x")
-print(f"Преимущество над FP16:         {fp16_ms / dp4a_ms:.3f}x")
-print(f"L2 погрешность:                {error_4096:.6f}")
+print(f"FP32 rocBLAS:  {fp32_ms:.3f} ms")
+print(f"FP16 rocBLAS:  {fp16_ms:.3f} ms")
+print(f"DP4ALinear:    {dp4a_ms:.3f} ms (Ускорение: {fp32_ms/dp4a_ms:.3f}x vs FP32, {fp16_ms/dp4a_ms:.3f}x vs FP16)")
+print_metrics("Точность 4096x4096", linear_dp4a(x), linear_fp32(x))
+
+# -----------------------------------------------------------------
+# 2. ТЕСТ SDXL [2, 77, 2048] БЕЗ ХОЛОСТОГО ПАДДИНГА СТРОК
+# -----------------------------------------------------------------
+print("\n" + "="*65)
+print(" ТЕСТ SDXL [2, 77, 2048] -> [2, 77, 1280] (Холостой паддинг M отключен!)")
 print("="*65)
-
-# -------------------------------------------------------------
-# ТЕСТ 2: Реальная неквадратная 3D-форма SDXL [Batch=2, Seq=77, In=2048] -> Out=1280
-# -------------------------------------------------------------
-sdxl_in = 2048
-sdxl_out = 1280
-linear_sdxl_fp32 = nn.Linear(sdxl_in, sdxl_out, bias=True).cuda()
-linear_sdxl_dp4a = DP4ALinear(linear_sdxl_fp32, ext)
-
-x_sdxl = torch.randn(2, 77, sdxl_in, device="cuda", dtype=torch.float32)
+sdxl_l_fp32 = nn.Linear(2048, 1280, bias=True).cuda()
+sdxl_l_dp4a = DP4ALinear(sdxl_l_fp32, ext)
+x_sdxl = torch.randn(2, 77, 2048, device="cuda", dtype=torch.float32)
 
 with torch.inference_mode():
-    out_sdxl_fp32 = linear_sdxl_fp32(x_sdxl)
-    out_sdxl_dp4a = linear_sdxl_dp4a(x_sdxl)
+    out_ref = sdxl_l_fp32(x_sdxl)
+    out_test = sdxl_l_dp4a(x_sdxl)
 
-assert out_sdxl_dp4a.shape == out_sdxl_fp32.shape, f"Формы не совпали: {out_sdxl_dp4a.shape} vs {out_sdxl_fp32.shape}"
-sdxl_error = (torch.linalg.vector_norm(out_sdxl_dp4a - out_sdxl_fp32) / torch.linalg.vector_norm(out_sdxl_fp32)).item()
+assert out_test.shape == out_ref.shape, "Формы не совпали!"
+print(f"Форма: {list(x_sdxl.shape)} -> {list(out_test.shape)}")
+print_metrics("Точность SDXL 3D", out_test, out_ref)
 
+# -----------------------------------------------------------------
+# 3. ГРАНИЧНЫЙ ТЕСТ: M = 1 (Одиночный токен)
+# -----------------------------------------------------------------
 print("\n" + "="*65)
-print(f" ТЕСТ 2: НЕКВАДРАТНЫЙ 3D-ТЕНЗОР SDXL [2, 77, 2048] -> [2, 77, 1280]")
+print(" ГРАНИЧНЫЙ ТЕСТ: M = 1 [1, 2048] -> [1, 1280]")
 print("="*65)
-print(f"Форма входа:    {list(x_sdxl.shape)}")
-print(f"Форма выхода:   {list(out_sdxl_dp4a.shape)}")
-print(f"L2 погрешность: {sdxl_error:.6f}")
-print("СТАТУС: Динамический паддинг отработал безупречно!")
+x_single = torch.randn(1, 2048, device="cuda", dtype=torch.float32)
+with torch.inference_mode():
+    out_single_ref = sdxl_l_fp32(x_single)
+    out_single_test = sdxl_l_dp4a(x_single)
+print_metrics("Точность M = 1", out_single_test, out_single_ref)
 print("="*65 + "\n")

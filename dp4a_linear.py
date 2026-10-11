@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear with strict device placement and dynamic shape handling."""
+"""Production-grade DP4ALinear without wasteful M-padding."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -27,10 +27,8 @@ class DP4ALinear(nn.Module):
         self.in_features = linear.in_features
         self.out_features = linear.out_features
 
-        # Привязываемся строго к устройству исходных весов (никакого хардкода .cuda()!)
         target_device = linear.weight.device
 
-        # Паддинг для весов: K кратно 64, N кратно 64
         self.pad_k = (64 - (self.in_features % 64)) % 64
         self.pad_n = (64 - (self.out_features % 64)) % 64
 
@@ -48,7 +46,6 @@ class DP4ALinear(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Строгие проверки безопасности
         if x.numel() == 0:
             return x
         if x.shape[-1] != self.in_features:
@@ -59,36 +56,33 @@ class DP4ALinear(nn.Module):
         orig_shape = x.shape
         x_dtype = x.dtype
 
-        # Разворачиваем любые размерности (2D, 3D, батчи) в [M, K]
         x_2d = x.reshape(-1, self.in_features).contiguous().float()
         M, K = x_2d.shape
 
-        # Динамический паддинг: M к 128, K к 64
-        pad_m = (128 - (M % 128)) % 128
-        pad_k = self.pad_k
-
-        if pad_m > 0 or pad_k > 0:
-            x_padded = F.pad(x_2d, (0, pad_k, 0, pad_m)).contiguous()
+        # ХОЛОСТОЙ ПАДДИНГ M ЛИКВИДИРОВАН!
+        # Паддим только K по горизонтали (если K не кратно 64). Строки M НЕ трогаем!
+        if self.pad_k > 0:
+            x_padded = F.pad(x_2d, (0, self.pad_k, 0, 0)).contiguous()
         else:
             x_padded = x_2d
 
-        M_padded, K_padded = x_padded.shape
+        M_real, K_padded = x_padded.shape
 
-        # Согласованное вычисление масштаба с Python и C++
+        # Масштаб активаций
         a_scale = float((x_padded.abs().amax() / 127.0).clamp_min(1e-12).item())
 
-        # Быстрая C++ упаковка
+        # C++ упаковка ровно M_real строк (без 102 лишних нулей!)
         a_packed_1d = self.ext.quantize_pack_symmetric(x_padded, a_scale)
-        a_packed = a_packed_1d.view(M_padded, K_padded // 4)
+        a_packed = a_packed_1d.view(M_real, K_padded // 4)
 
-        # Fused GEMM на чипе
+        # Вызов ядра: передаем честный M_real! Ядро само отсечет хвостик.
         y = self.ext.fused_forward(
             a_packed, self.weight_packed, self.weight_scale,
             self.bias, a_scale,
-            M_padded, self.weight_packed.shape[0], K_padded // 4
+            M_real, self.weight_packed.shape[0], K_padded // 4
         )
 
-        # Срезаем паддинг
-        y = y[:M, :self.out_features]
+        # Срезаем паддинг по N (если был)
+        y = y[:, :self.out_features]
 
         return y.reshape(*orig_shape[:-1], self.out_features).to(dtype=x_dtype)
