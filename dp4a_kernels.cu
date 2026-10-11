@@ -132,7 +132,7 @@ __global__ void symmetric_quantize_pack_kernel(
     packed[group] = static_cast<int32_t>(word);
 }
 
-// Обёртка Fused-слоя
+// Обёртка Fused-слоя с проверками совпадения устройств
 torch::Tensor dp4a_linear_fused_forward(
     torch::Tensor a_packed,
     torch::Tensor bt_packed,
@@ -142,6 +142,12 @@ torch::Tensor dp4a_linear_fused_forward(
     int64_t m, int64_t n, int64_t k4) 
 {
     TORCH_CHECK(a_packed.is_cuda() && bt_packed.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(a_packed.device() == bt_packed.device(), "a_packed and bt_packed must be on the same device");
+    TORCH_CHECK(weight_scales.device() == a_packed.device(), "weight_scales must be on the same device as inputs");
+    if (bias.has_value() && bias->defined()) {
+        TORCH_CHECK(bias->device() == a_packed.device(), "bias must be on the same device as inputs");
+    }
+
     c10::cuda::CUDAGuard device_guard(a_packed.device());
     auto stream = c10::cuda::getCurrentCUDAStream(a_packed.get_device());
 
