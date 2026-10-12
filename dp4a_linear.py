@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear with native FP16/BF16/FP32 zero-copy input packing and _apply protection."""
+"""Production-grade DP4ALinear with native FP16/BF16/FP32 zero-copy input packing, _apply protection, and Inf/NaN safety."""
 import copy
 import torch
 import torch.nn as nn
@@ -46,11 +46,7 @@ class DP4ALinear(nn.Module):
             self.bias = None
 
     def _apply(self, fn):
-        """
-        БРОНЕБОЙНАЯ ЗАЩИТА:
-        Позволяет перемещать слой между GPU/CPU, но блокирует попытки
-        привести служебные буферы к float16 при вызове model.half()!
-        """
+        """Защита от model.half(): weight_scale и bias всегда остаются float32!"""
         super()._apply(fn)
         if hasattr(self, "weight_scale") and self.weight_scale is not None:
             self.weight_scale = self.weight_scale.to(dtype=torch.float32)
@@ -86,7 +82,7 @@ class DP4ALinear(nn.Module):
         orig_shape = x.shape
         x_dtype = x.dtype
 
-        # Сохраняем исходный dtype входа (float16/bfloat16/float32)
+        # Нативный вход без принудительного .float()!
         x_2d = x.reshape(-1, self.in_features).contiguous()
         M, K = x_2d.shape
 
@@ -97,8 +93,9 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # Построчный масштаб (активации не дублируются во float32)
-        a_scale_per_row = (x_padded.abs().amax(dim=1).float() / 127.0).clamp_min(1e-12).contiguous()
+        # ЗАЩИТА МАСШТАБА ОТ Inf И NaN:
+        # nan_to_num(1.0) заменяет NaN на 1.0, а clamp(max=515.78) гарантирует конечный масштаб даже при Inf!
+        a_scale_per_row = (x_padded.abs().amax(dim=1).float() / 127.0).nan_to_num(1.0).clamp(min=1e-12, max=515.78).contiguous()
 
-        # Быстрая C++ упаковка читает вход напрямую в его нативном типе
-        a_pac
+        # C++ ядро с аппаратной фильтрацией isnan и isinf прямо в регистрах
+        a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded,

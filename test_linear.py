@@ -61,7 +61,7 @@ def bench_median(fn, iters=20):
     return times[len(times) // 2], times[0], times[-1]
 
 # -----------------------------------------------------------------
-# 1. ТЕСТ 4096x4096 (Синхронизированные веса и Fake-Quant)
+# 1. ТЕСТ 4096x4096
 # -----------------------------------------------------------------
 size = 4096
 iters = 20
@@ -72,4 +72,55 @@ linear_fp16.bias.data.copy_(linear_fp32.bias.data.half())
 
 linear_dp4a = DP4ALinear(linear_fp32, ext)
 
-x_fp32 = torc
+x_fp32 = torch.randn(size, size, device="cuda", dtype=torch.float32)
+x_fp16 = x_fp32.half()
+
+with torch.inference_mode():
+    for _ in range(10):
+        _ = linear_fp32(x_fp32)
+        _ = linear_fp16(x_fp16)
+        _ = linear_dp4a(x_fp32)
+    torch.cuda.synchronize()
+
+    fp32_med, fp32_min, fp32_max = bench_median(lambda: linear_fp32(x_fp32))
+    fp16_med, fp16_min, fp16_max = bench_median(lambda: linear_fp16(x_fp16))
+    dp4a_med, dp4a_min, dp4a_max = bench_median(lambda: linear_dp4a(x_fp32))
+
+out_fp32 = linear_fp32(x_fp32)
+out_dp4a = linear_dp4a(x_fp32)
+out_fake = compute_fake_quant_ref(linear_fp32, linear_dp4a, x_fp32)
+
+print("\n" + "="*70)
+print(f" ТЕСТ 1: КВАДРАТНЫЙ СЛОЙ ({size}x{size})")
+print("="*70)
+print(f"FP32 rocBLAS:  {fp32_med:.3f} ms (min: {fp32_min:.3f}, max: {fp32_max:.3f})")
+print(f"FP16 rocBLAS:  {fp16_med:.3f} ms (min: {fp16_min:.3f}, max: {fp16_max:.3f})")
+print(f"DP4ALinear:    {dp4a_med:.3f} ms (min: {dp4a_min:.3f}, max: {dp4a_max:.3f})")
+print("-" * 70)
+print(f"Ускорение относительно FP32: {fp32_med / dp4a_med:.3f}x")
+print(f"Преимущество над FP16:       {fp16_med / dp4a_med:.3f}x")
+print_detailed_metrics("Валидация точности 4096x4096", out_dp4a, out_fp32, out_fake)
+
+# -----------------------------------------------------------------
+# 2. ТЕСТ СТРЕСС-НЕЙТРАЛИЗАЦИИ Inf И NaN
+# -----------------------------------------------------------------
+print("\n" + "="*70)
+print(" ТЕСТ 2: НАМЕРЕННАЯ ИНЪЕКЦИЯ Inf И NaN В АКТИВАЦИИ")
+print("="*70)
+x_corrupt = torch.randn(size, size, device="cuda", dtype=torch.float32)
+x_corrupt[0, 5] = float("nan")
+x_corrupt[1, 10] = float("inf")
+x_corrupt[2, 20] = float("-inf")
+
+with torch.inference_mode():
+    out_sanitized = linear_dp4a(x_corrupt)
+
+# Проверяем, что в выходном тензоре НЕТ NaN и Inf!
+has_nan = torch.isnan(out_sanitized).any().item()
+has_inf = torch.isinf(out_sanitized).any().item()
+
+assert not has_nan, "ОШИБКА: выход содержит NaN!"
+assert not has_inf, "ОШИБКА: выход содержит Inf!"
+print("УСПЕХ: Внедренные Inf и NaN нейтрализованы прямо в регистрах GPU!")
+print("Выходной тензор полностью конечен (finite) и пригоден для дальнейшей работы!")
+print("="*70 + "\n")

@@ -161,7 +161,7 @@ __global__ void dp4a_mm_tiled_fused_kernel(
     }
 }
 
-// 3. ШАБЛОННЫЙ КВАНТОВАТЕЛЬ (ЧИТАЕТ float, half и bfloat16 НАПРЯМУЮ)
+// 3. ШАБЛОННЫЙ КВАНТОВАТЕЛЬ С АППАРАТНОЙ ФИЛЬТРАЦИЕЙ INF И NAN
 template <typename scalar_t>
 __global__ void symmetric_quantize_pack_per_row_kernel(
     const scalar_t* __restrict__ x,
@@ -183,7 +183,15 @@ __global__ void symmetric_quantize_pack_per_row_kernel(
         const int64_t i = base + j;
         int32_t q = 0;
         if (i < count) {
-            float val = static_cast<float>(x[i]); // Распаковка прямо в регистре!
+            float val = static_cast<float>(x[i]);
+            
+            // НУЛЕВАЯ СТОИМОСТЬ: Фильтрация NaN и Inf прямо в регистре!
+            if (isnan(val)) {
+                val = 0.0f;
+            } else if (isinf(val)) {
+                val = (val > 0.0f) ? 65504.0f : -65504.0f; // Ограничение потолком FP16
+            }
+
             q = static_cast<int32_t>(nearbyintf(val * inv_scale));
             q = q < -127 ? -127 : (q > 127 ? 127 : q);
         }
@@ -267,7 +275,6 @@ torch::Tensor quantize_pack_symmetric_per_row_gpu(torch::Tensor x, torch::Tensor
     const int64_t groups = x.numel() / 4;
     const int blocks = static_cast<int>((groups + threads - 1) / threads);
 
-    // Диспетчеризация типов данных: читаем float, half или bfloat16 напрямую!
     if (x.scalar_type() == torch::kFloat32) {
         symmetric_quantize_pack_per_row_kernel<float><<<blocks, threads, 0, stream>>>(
             x.data_ptr<float>(), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
@@ -392,7 +399,7 @@ __global__ void affine_quantize_pack_kernel(
     const float* __restrict__ scale_ptr,
     const int32_t* __restrict__ zp_ptr,
     int32_t* __restrict__ packed,
-    int64_t count) {
+    int64_count) {
     const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t base = group * 4;
     if (base >= count) return;
