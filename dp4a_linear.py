@@ -94,8 +94,17 @@ class DP4ALinear(nn.Module):
         M_real, K_padded = x_padded.shape
 
         # ЗАЩИТА МАСШТАБА ОТ Inf И NaN:
-        # nan_to_num(1.0) заменяет NaN на 1.0, а clamp(max=515.78) гарантирует конечный масштаб даже при Inf!
         a_scale_per_row = (x_padded.abs().amax(dim=1).float() / 127.0).nan_to_num(1.0).clamp(min=1e-12, max=515.78).contiguous()
 
         # C++ ядро с аппаратной фильтрацией isnan и isinf прямо в регистрах
-        a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded,
+        a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded, a_scale_per_row, K_padded)
+        a_packed = a_packed_1d.view(M_real, K_padded // 4)
+
+        # Fused GEMM
+        y = self._ext_ref.fused_forward(
+            a_packed, self.weight_packed, self.weight_scale,
+            self.bias, a_scale_per_row,
+            M_real, self.out_features, K_padded // 4
+        )
+
+        return y.reshape(*orig_shape[:-1], self.out_features).to(dtype=x_dtype)
