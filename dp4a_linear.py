@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear without wasteful M-padding."""
+"""Production-grade DP4ALinear with zero-sync scaling and strict PyTorch contracts."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -46,12 +46,20 @@ class DP4ALinear(nn.Module):
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
-            return x
+        # 1. Валидация контракта PyTorch
+        if x.ndim < 1:
+            raise ValueError("DP4ALinear expects an input with at least one dimension")
         if x.shape[-1] != self.in_features:
-            raise ValueError(f"DP4ALinear: ожидалась размерность входа {self.in_features}, получено {x.shape[-1]}")
+            raise ValueError(f"DP4ALinear: expected in_features={self.in_features}, got {x.shape[-1]}")
+        if not x.is_floating_point():
+            raise TypeError("DP4ALinear only supports floating point inputs")
+        
+        # Корректная обработка пустого тензора (возвращаем правильную выходную форму!)
+        if x.numel() == 0:
+            return x.new_empty((*x.shape[:-1], self.out_features))
+
         if x.device != self.weight_packed.device:
-            raise RuntimeError(f"DP4ALinear: вход на {x.device}, а веса слоя на {self.weight_packed.device}")
+            raise RuntimeError(f"DP4ALinear: input on {x.device}, layer on {self.weight_packed.device}")
 
         orig_shape = x.shape
         x_dtype = x.dtype
@@ -59,8 +67,6 @@ class DP4ALinear(nn.Module):
         x_2d = x.reshape(-1, self.in_features).contiguous().float()
         M, K = x_2d.shape
 
-        # ХОЛОСТОЙ ПАДДИНГ M ЛИКВИДИРОВАН!
-        # Паддим только K по горизонтали (если K не кратно 64). Строки M НЕ трогаем!
         if self.pad_k > 0:
             x_padded = F.pad(x_2d, (0, self.pad_k, 0, 0)).contiguous()
         else:
@@ -68,21 +74,19 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # Масштаб активаций
-        a_scale = float((x_padded.abs().amax() / 127.0).clamp_min(1e-12).item())
+        # 2. НОЛЬ СИНХРОНИЗАЦИЙ (.item() ЛИКВИДИРОВАН): масштаб остаётся на GPU!
+        a_scale_tensor = (x_padded.abs().amax() / 127.0).clamp_min(1e-12).to(torch.float32).reshape(())
 
-        # C++ упаковка ровно M_real строк (без 102 лишних нулей!)
-        a_packed_1d = self.ext.quantize_pack_symmetric(x_padded, a_scale)
+        # 3. C++ упаковка с передачей тензора
+        a_packed_1d = self.ext.quantize_pack_symmetric(x_padded, a_scale_tensor)
         a_packed = a_packed_1d.view(M_real, K_padded // 4)
 
-        # Вызов ядра: передаем честный M_real! Ядро само отсечет хвостик.
+        # 4. Fused GEMM/GEMV: чип сам выберет GEMV при M=1
         y = self.ext.fused_forward(
             a_packed, self.weight_packed, self.weight_scale,
-            self.bias, a_scale,
+            self.bias, a_scale_tensor,
             M_real, self.weight_packed.shape[0], K_padded // 4
         )
 
-        # Срезаем паддинг по N (если был)
         y = y[:, :self.out_features]
-
         return y.reshape(*orig_shape[:-1], self.out_features).to(dtype=x_dtype)
