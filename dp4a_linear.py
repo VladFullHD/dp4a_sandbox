@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear with zero-sync scaling and strict PyTorch contracts."""
+"""Production-grade DP4ALinear with zero-sync scaling and safe padded bias."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -40,24 +40,26 @@ class DP4ALinear(nn.Module):
         self.register_buffer("weight_scale", ws.float().to(device=target_device))
         self.register_buffer("weight_packed", pack_i8_rows_cpu_init(wq).to(device=target_device))
 
+        # ИСПРАВЛЕНИЕ КРИТИЧЕСКОГО БАГА BIAS:
+        # Дополняем bias нулями до длины N_padded, чтобы GPU-ядро не читало память за границами массива!
         if linear.bias is not None:
-            self.register_buffer("bias", linear.bias.detach().float().contiguous().to(device=target_device))
+            b = linear.bias.detach().float()
+            if self.pad_n > 0:
+                b = F.pad(b, (0, self.pad_n))
+            self.register_buffer("bias", b.contiguous().to(device=target_device))
         else:
             self.bias = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 1. Валидация контракта PyTorch
+        # Строгий контракт PyTorch nn.Linear
         if x.ndim < 1:
             raise ValueError("DP4ALinear expects an input with at least one dimension")
         if x.shape[-1] != self.in_features:
             raise ValueError(f"DP4ALinear: expected in_features={self.in_features}, got {x.shape[-1]}")
         if not x.is_floating_point():
             raise TypeError("DP4ALinear only supports floating point inputs")
-        
-        # Корректная обработка пустого тензора (возвращаем правильную выходную форму!)
         if x.numel() == 0:
             return x.new_empty((*x.shape[:-1], self.out_features))
-
         if x.device != self.weight_packed.device:
             raise RuntimeError(f"DP4ALinear: input on {x.device}, layer on {self.weight_packed.device}")
 
@@ -74,14 +76,13 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # 2. НОЛЬ СИНХРОНИЗАЦИЙ (.item() ЛИКВИДИРОВАН): масштаб остаётся на GPU!
+        # Ноль синхронизаций с CPU: a_scale остаётся в VRAM как CUDA-тензор!
         a_scale_tensor = (x_padded.abs().amax() / 127.0).clamp_min(1e-12).to(torch.float32).reshape(())
 
-        # 3. C++ упаковка с передачей тензора
         a_packed_1d = self.ext.quantize_pack_symmetric(x_padded, a_scale_tensor)
         a_packed = a_packed_1d.view(M_real, K_padded // 4)
 
-        # 4. Fused GEMM/GEMV: чип сам выберет GEMV при M=1
+        # Вызов ядра
         y = self.ext.fused_forward(
             a_packed, self.weight_packed, self.weight_scale,
             self.bias, a_scale_tensor,
