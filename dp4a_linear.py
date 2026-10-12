@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear with per-token scaling, zero N-padding, and contiguous output."""
+"""Production-grade DP4ALinear with native FP16/BF16/FP32 zero-copy input packing."""
 import copy
 import torch
 import torch.nn as nn
@@ -24,14 +24,12 @@ def pack_i8_rows_cpu_init(q: torch.Tensor) -> torch.Tensor:
 class DP4ALinear(nn.Module):
     def __init__(self, linear: nn.Linear, ext):
         super().__init__()
-        # Приватная ссылка для совместимости с deepcopy
         self._ext_ref = ext
         self.in_features = linear.in_features
         self.out_features = linear.out_features
 
         target_device = linear.weight.device
 
-        # Паддинг только для K (K кратно 64). N НЕ ПАДДИМ ВООБЩЕ (совет Клода)!
         self.pad_k = (64 - (self.in_features % 64)) % 64
 
         weight = linear.weight.detach().float()
@@ -47,8 +45,14 @@ class DP4ALinear(nn.Module):
         else:
             self.bias = None
 
+    def _apply(self, fn):
+        """Защита от model.half(): weight_scale всегда обязан оставаться float32!"""
+        super()._apply(fn)
+        if hasattr(self, "weight_scale") and self.weight_scale is not None:
+            self.weight_scale = self.weight_scale.to(torch.float32)
+        return self
+
     def __deepcopy__(self, memo):
-        # Безопасное клонирование для ComfyUI (не ломает pickle C++ модуля)
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
@@ -74,7 +78,8 @@ class DP4ALinear(nn.Module):
         orig_shape = x.shape
         x_dtype = x.dtype
 
-        x_2d = x.reshape(-1, self.in_features).contiguous().float()
+        # НИКАКОГО .float()! Сохраняем исходный dtype (float16/bfloat16/float32) без копирования!
+        x_2d = x.reshape(-1, self.in_features).contiguous()
         M, K = x_2d.shape
 
         if self.pad_k > 0:
@@ -84,15 +89,14 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # ПОСТРОЧНЫЙ МАСШТАБ (PER-TOKEN): вектор [M_real] вместо скаляра!
-        # Изолирует токены и CFG-батч SDXL друг от друга
-        a_scale_per_row = (x_padded.abs().amax(dim=1) / 127.0).clamp_min(1e-12).to(torch.float32).contiguous()
+        # Построчный масштаб (считается во float32 для точности, но сам x_padded НЕ конвертируется)
+        a_scale_per_row = (x_padded.abs().amax(dim=1).float() / 127.0).clamp_min(1e-12).contiguous()
 
-        # Быстрая C++ упаковка с построчным масштабом
+        # Быстрая C++ упаковка читает x_padded напрямую в его нативном типе (half/float)
         a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded, a_scale_per_row, K_padded)
         a_packed = a_packed_1d.view(M_real, K_padded // 4)
 
-        # Fused GEMM: выход формируется сразу размера [M_real, out_features] без срезки!
+        # Fused GEMM
         y = self._ext_ref.fused_forward(
             a_packed, self.weight_packed, self.weight_scale,
             self.bias, a_scale_per_row,

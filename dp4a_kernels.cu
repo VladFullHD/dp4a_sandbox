@@ -13,7 +13,7 @@ __device__ __forceinline__ int32_t sdot4(int32_t a, int32_t b, int32_t acc) {
 #endif
 }
 
-// 1. GEMV ЯДРО ДЛЯ M = 1 (Чтение масштаба по указателю)
+// 1. GEMV ЯДРО ДЛЯ M = 1
 __global__ void dp4a_gemv_fused_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -67,7 +67,7 @@ __global__ void dp4a_gemv_fused_kernel(
     }
 }
 
-// 2. FUSED GEMM: ПОСТРОЧНЫЙ МАСШТАБ АКТИВАЦИЙ a_scale_ptr[r_glob]
+// 2. FUSED GEMM ДЛЯ M > 1
 __global__ void dp4a_mm_tiled_fused_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -142,12 +142,11 @@ __global__ void dp4a_mm_tiled_fused_kernel(
         __syncthreads();
     }
 
-    // ПОСТРОЧНЫЙ МАСШТАБ: читается 1 раз на строку r
     #pragma unroll
     for (int r = 0; r < 8; ++r) {
         const int r_glob = row0 + r;
         if (r_glob < m) {
-            float a_scale = a_scale_ptr[r_glob]; // Масштаб конкретного токена/строки!
+            float a_scale = a_scale_ptr[r_glob];
             #pragma unroll
             for (int ci = 0; ci < 4; ++ci) {
                 const int c_glob = col0 + ci;
@@ -162,9 +161,10 @@ __global__ void dp4a_mm_tiled_fused_kernel(
     }
 }
 
-// 3. ПОСТРОЧНЫЙ СИММЕТРИЧНЫЙ КВАНТОВАТЕЛЬ
+// 3. ШАБЛОННЫЙ КВАНТОВАТЕЛЬ (ЧИТАЕТ float, half и bfloat16 НАПРЯМУЮ)
+template <typename scalar_t>
 __global__ void symmetric_quantize_pack_per_row_kernel(
-    const float* __restrict__ x,
+    const scalar_t* __restrict__ x,
     const float* __restrict__ scale_ptr,
     int32_t* __restrict__ packed,
     int64_t count,
@@ -173,7 +173,6 @@ __global__ void symmetric_quantize_pack_per_row_kernel(
     const int64_t base = group * 4;
     if (base >= count) return;
 
-    // Группа из 4 элементов лежит в одной строке (т.к. k_padded кратен 4)
     const int64_t row = base / k_padded;
     const float scale = scale_ptr[row];
     const float inv_scale = 1.0f / fmaxf(scale, 1.0e-12f);
@@ -184,7 +183,8 @@ __global__ void symmetric_quantize_pack_per_row_kernel(
         const int64_t i = base + j;
         int32_t q = 0;
         if (i < count) {
-            q = static_cast<int32_t>(nearbyintf(x[i] * inv_scale));
+            float val = static_cast<float>(x[i]); // Распаковка прямо в регистре!
+            q = static_cast<int32_t>(nearbyintf(val * inv_scale));
             q = q < -127 ? -127 : (q > 127 ? 127 : q);
         }
         word |= (static_cast<uint32_t>(q) & 0xffu) << (8 * j);
@@ -205,7 +205,7 @@ torch::Tensor dp4a_linear_fused_forward(
     TORCH_CHECK(a_packed.scalar_type() == torch::kInt32 && bt_packed.scalar_type() == torch::kInt32, "Packed inputs must be int32");
     TORCH_CHECK(weight_scales.is_cuda() && weight_scales.scalar_type() == torch::kFloat32, "weight_scales must be float32 CUDA tensor");
     TORCH_CHECK(a_scale_tensor.is_cuda() && a_scale_tensor.scalar_type() == torch::kFloat32, "a_scale must be float32 CUDA tensor");
-    TORCH_CHECK(a_scale_tensor.numel() >= m, "a_scale tensor size must be >= m (per-row scale)");
+    TORCH_CHECK(a_scale_tensor.numel() >= m, "a_scale tensor size must be >= m");
     TORCH_CHECK(a_packed.is_contiguous() && bt_packed.is_contiguous() && weight_scales.is_contiguous(), "Inputs must be contiguous");
     TORCH_CHECK(a_packed.device() == bt_packed.device() && a_packed.device() == weight_scales.device(), "Device mismatch");
     TORCH_CHECK(m > 0 && n > 0 && k4 > 0, "Dimensions must be positive");
@@ -252,9 +252,9 @@ torch::Tensor dp4a_linear_fused_forward(
     return out;
 }
 
+// Быстрая упаковка C++ (принимает float32, float16 и bfloat16)
 torch::Tensor quantize_pack_symmetric_per_row_gpu(torch::Tensor x, torch::Tensor scale_tensor, int64_t k_padded) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be contiguous GPU tensor");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
     TORCH_CHECK(scale_tensor.is_cuda() && scale_tensor.scalar_type() == torch::kFloat32, "scale must be CUDA float32");
     if (x.numel() == 0) return torch::empty({0}, x.options().dtype(torch::kInt32));
     TORCH_CHECK(x.numel() % 4 == 0, "x.numel() must be divisible by 4");
@@ -267,9 +267,22 @@ torch::Tensor quantize_pack_symmetric_per_row_gpu(torch::Tensor x, torch::Tensor
     const int64_t groups = x.numel() / 4;
     const int blocks = static_cast<int>((groups + threads - 1) / threads);
 
-    symmetric_quantize_pack_per_row_kernel<<<blocks, threads, 0, stream>>>(
-        x.data_ptr<float>(), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
-    );
+    // Диспетчеризация типов данных: читаем float, half или bfloat16 напрямую!
+    if (x.scalar_type() == torch::kFloat32) {
+        symmetric_quantize_pack_per_row_kernel<float><<<blocks, threads, 0, stream>>>(
+            x.data_ptr<float>(), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
+        );
+    } else if (x.scalar_type() == torch::kFloat16) {
+        symmetric_quantize_pack_per_row_kernel<c10::Half><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const c10::Half*>(x.data_ptr<at::Half>()), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
+        );
+    } else if (x.scalar_type() == torch::kBFloat16) {
+        symmetric_quantize_pack_per_row_kernel<c10::BFloat16><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<const c10::BFloat16*>(x.data_ptr<at::BFloat16>()), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
+        );
+    } else {
+        TORCH_CHECK(false, "x must be float32, float16, or bfloat16");
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return out;
 }
