@@ -1,4 +1,5 @@
-"""Production-grade DP4ALinear with zero-sync scaling and safe padded bias."""
+"""Production-grade DP4ALinear with per-token scaling, zero N-padding, and contiguous output."""
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,35 +24,42 @@ def pack_i8_rows_cpu_init(q: torch.Tensor) -> torch.Tensor:
 class DP4ALinear(nn.Module):
     def __init__(self, linear: nn.Linear, ext):
         super().__init__()
-        self.ext = ext
+        # Приватная ссылка для совместимости с deepcopy
+        self._ext_ref = ext
         self.in_features = linear.in_features
         self.out_features = linear.out_features
 
         target_device = linear.weight.device
 
+        # Паддинг только для K (K кратно 64). N НЕ ПАДДИМ ВООБЩЕ (совет Клода)!
         self.pad_k = (64 - (self.in_features % 64)) % 64
-        self.pad_n = (64 - (self.out_features % 64)) % 64
 
         weight = linear.weight.detach().float()
-        if self.pad_n > 0 or self.pad_k > 0:
-            weight = F.pad(weight, (0, self.pad_k, 0, self.pad_n))
+        if self.pad_k > 0:
+            weight = F.pad(weight, (0, self.pad_k))
 
         wq, ws = quantize_per_channel_weights(weight)
         self.register_buffer("weight_scale", ws.float().to(device=target_device))
         self.register_buffer("weight_packed", pack_i8_rows_cpu_init(wq).to(device=target_device))
 
-        # ИСПРАВЛЕНИЕ КРИТИЧЕСКОГО БАГА BIAS:
-        # Дополняем bias нулями до длины N_padded, чтобы GPU-ядро не читало память за границами массива!
         if linear.bias is not None:
-            b = linear.bias.detach().float()
-            if self.pad_n > 0:
-                b = F.pad(b, (0, self.pad_n))
-            self.register_buffer("bias", b.contiguous().to(device=target_device))
+            self.register_buffer("bias", linear.bias.detach().float().contiguous().to(device=target_device))
         else:
             self.bias = None
 
+    def __deepcopy__(self, memo):
+        # Безопасное клонирование для ComfyUI (не ломает pickle C++ модуля)
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for k, v in self.__dict__.items():
+            if k == "_ext_ref":
+                setattr(result, k, v)
+            else:
+                setattr(result, k, copy.deepcopy(v, memo))
+        return result
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Строгий контракт PyTorch nn.Linear
         if x.ndim < 1:
             raise ValueError("DP4ALinear expects an input with at least one dimension")
         if x.shape[-1] != self.in_features:
@@ -76,18 +84,19 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # Ноль синхронизаций с CPU: a_scale остаётся в VRAM как CUDA-тензор!
-        a_scale_tensor = (x_padded.abs().amax() / 127.0).clamp_min(1e-12).to(torch.float32).reshape(())
+        # ПОСТРОЧНЫЙ МАСШТАБ (PER-TOKEN): вектор [M_real] вместо скаляра!
+        # Изолирует токены и CFG-батч SDXL друг от друга
+        a_scale_per_row = (x_padded.abs().amax(dim=1) / 127.0).clamp_min(1e-12).to(torch.float32).contiguous()
 
-        a_packed_1d = self.ext.quantize_pack_symmetric(x_padded, a_scale_tensor)
+        # Быстрая C++ упаковка с построчным масштабом
+        a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded, a_scale_per_row, K_padded)
         a_packed = a_packed_1d.view(M_real, K_padded // 4)
 
-        # Вызов ядра
-        y = self.ext.fused_forward(
+        # Fused GEMM: выход формируется сразу размера [M_real, out_features] без срезки!
+        y = self._ext_ref.fused_forward(
             a_packed, self.weight_packed, self.weight_scale,
-            self.bias, a_scale_tensor,
-            M_real, self.weight_packed.shape[0], K_padded // 4
+            self.bias, a_scale_per_row,
+            M_real, self.out_features, K_padded // 4
         )
 
-        y = y[:, :self.out_features]
         return y.reshape(*orig_shape[:-1], self.out_features).to(dtype=x_dtype)

@@ -13,7 +13,7 @@ __device__ __forceinline__ int32_t sdot4(int32_t a, int32_t b, int32_t acc) {
 #endif
 }
 
-// 1. СПЕЦИАЛИЗИРОВАННОЕ GEMV ЯДРО ДЛЯ M = 1
+// 1. GEMV ЯДРО ДЛЯ M = 1 (Чтение масштаба по указателю)
 __global__ void dp4a_gemv_fused_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -54,7 +54,7 @@ __global__ void dp4a_gemv_fused_kernel(
     }
 
     if (tid == 0) {
-        float a_scale = *a_scale_ptr;
+        float a_scale = a_scale_ptr[0];
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
             int col = col0 + i;
@@ -67,7 +67,7 @@ __global__ void dp4a_gemv_fused_kernel(
     }
 }
 
-// 2. FUSED GEMM ЯДРО ДЛЯ M > 1
+// 2. FUSED GEMM: ПОСТРОЧНЫЙ МАСШТАБ АКТИВАЦИЙ a_scale_ptr[r_glob]
 __global__ void dp4a_mm_tiled_fused_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -142,26 +142,139 @@ __global__ void dp4a_mm_tiled_fused_kernel(
         __syncthreads();
     }
 
-    float a_scale = *a_scale_ptr;
-
+    // ПОСТРОЧНЫЙ МАСШТАБ: читается 1 раз на строку r
     #pragma unroll
     for (int r = 0; r < 8; ++r) {
-        #pragma unroll
-        for (int ci = 0; ci < 4; ++ci) {
-            const int r_glob = row0 + r;
-            const int c_glob = col0 + ci;
-
-            if (r_glob < m && c_glob < n) {
-                float w_scale = weight_scales[c_glob];
-                float val = static_cast<float>(acc[r][ci]) * (a_scale * w_scale);
-                if (bias != nullptr) val += bias[c_glob];
-                c[static_cast<int64_t>(r_glob) * n + c_glob] = val;
+        const int r_glob = row0 + r;
+        if (r_glob < m) {
+            float a_scale = a_scale_ptr[r_glob]; // Масштаб конкретного токена/строки!
+            #pragma unroll
+            for (int ci = 0; ci < 4; ++ci) {
+                const int c_glob = col0 + ci;
+                if (c_glob < n) {
+                    float w_scale = weight_scales[c_glob];
+                    float val = static_cast<float>(acc[r][ci]) * (a_scale * w_scale);
+                    if (bias != nullptr) val += bias[c_glob];
+                    c[static_cast<int64_t>(r_glob) * n + c_glob] = val;
+                }
             }
         }
     }
 }
 
-// 3. ЧЕСТНОЕ INT32 TILED-ЯДРО (ДЛЯ ТОЧНОЙ ВЕРИФИКАЦИИ В BENCHMARK.PY)
+// 3. ПОСТРОЧНЫЙ СИММЕТРИЧНЫЙ КВАНТОВАТЕЛЬ
+__global__ void symmetric_quantize_pack_per_row_kernel(
+    const float* __restrict__ x,
+    const float* __restrict__ scale_ptr,
+    int32_t* __restrict__ packed,
+    int64_t count,
+    int k_padded) {
+    const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t base = group * 4;
+    if (base >= count) return;
+
+    // Группа из 4 элементов лежит в одной строке (т.к. k_padded кратен 4)
+    const int64_t row = base / k_padded;
+    const float scale = scale_ptr[row];
+    const float inv_scale = 1.0f / fmaxf(scale, 1.0e-12f);
+
+    uint32_t word = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int64_t i = base + j;
+        int32_t q = 0;
+        if (i < count) {
+            q = static_cast<int32_t>(nearbyintf(x[i] * inv_scale));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+        }
+        word |= (static_cast<uint32_t>(q) & 0xffu) << (8 * j);
+    }
+    packed[group] = static_cast<int32_t>(word);
+}
+
+// Обёртка Fused-слоя
+torch::Tensor dp4a_linear_fused_forward(
+    torch::Tensor a_packed,
+    torch::Tensor bt_packed,
+    torch::Tensor weight_scales,
+    c10::optional<torch::Tensor> bias,
+    torch::Tensor a_scale_tensor,
+    int64_t m, int64_t n, int64_t k4) 
+{
+    TORCH_CHECK(a_packed.is_cuda() && bt_packed.is_cuda(), "Inputs must be CUDA tensors");
+    TORCH_CHECK(a_packed.scalar_type() == torch::kInt32 && bt_packed.scalar_type() == torch::kInt32, "Packed inputs must be int32");
+    TORCH_CHECK(weight_scales.is_cuda() && weight_scales.scalar_type() == torch::kFloat32, "weight_scales must be float32 CUDA tensor");
+    TORCH_CHECK(a_scale_tensor.is_cuda() && a_scale_tensor.scalar_type() == torch::kFloat32, "a_scale must be float32 CUDA tensor");
+    TORCH_CHECK(a_scale_tensor.numel() >= m, "a_scale tensor size must be >= m (per-row scale)");
+    TORCH_CHECK(a_packed.is_contiguous() && bt_packed.is_contiguous() && weight_scales.is_contiguous(), "Inputs must be contiguous");
+    TORCH_CHECK(a_packed.device() == bt_packed.device() && a_packed.device() == weight_scales.device(), "Device mismatch");
+    TORCH_CHECK(m > 0 && n > 0 && k4 > 0, "Dimensions must be positive");
+    TORCH_CHECK(k4 % 16 == 0, "k4 must be divisible by 16");
+
+    const float* bias_ptr = nullptr;
+    if (bias.has_value() && bias->defined()) {
+        TORCH_CHECK(bias->is_cuda() && bias->device() == a_packed.device(), "bias device mismatch");
+        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->is_contiguous(), "bias must be contiguous float32");
+        TORCH_CHECK(bias->numel() >= n, "bias size must be >= n");
+        bias_ptr = bias->data_ptr<float>();
+    }
+
+    c10::cuda::CUDAGuard device_guard(a_packed.device());
+    auto stream = c10::cuda::getCurrentCUDAStream(a_packed.get_device());
+    auto out = torch::empty({m, n}, a_packed.options().dtype(torch::kFloat32));
+
+    if (m == 1) {
+        dim3 block(256);
+        dim3 grid((n + 3) / 4);
+        dp4a_gemv_fused_kernel<<<grid, block, 0, stream>>>(
+            a_packed.data_ptr<int32_t>(),
+            bt_packed.data_ptr<int32_t>(),
+            out.data_ptr<float>(),
+            weight_scales.data_ptr<float>(),
+            bias_ptr,
+            a_scale_tensor.data_ptr<float>(),
+            static_cast<int>(n), static_cast<int>(k4)
+        );
+    } else {
+        dim3 block(16, 16);
+        dim3 grid((n + 63) / 64, (m + 127) / 128);
+        dp4a_mm_tiled_fused_kernel<<<grid, block, 0, stream>>>(
+            a_packed.data_ptr<int32_t>(),
+            bt_packed.data_ptr<int32_t>(),
+            out.data_ptr<float>(),
+            weight_scales.data_ptr<float>(),
+            bias_ptr,
+            a_scale_tensor.data_ptr<float>(),
+            static_cast<int>(m), static_cast<int>(n), static_cast<int>(k4)
+        );
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+torch::Tensor quantize_pack_symmetric_per_row_gpu(torch::Tensor x, torch::Tensor scale_tensor, int64_t k_padded) {
+    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be contiguous GPU tensor");
+    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
+    TORCH_CHECK(scale_tensor.is_cuda() && scale_tensor.scalar_type() == torch::kFloat32, "scale must be CUDA float32");
+    if (x.numel() == 0) return torch::empty({0}, x.options().dtype(torch::kInt32));
+    TORCH_CHECK(x.numel() % 4 == 0, "x.numel() must be divisible by 4");
+
+    c10::cuda::CUDAGuard device_guard(x.device());
+    auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
+    auto out = torch::empty({x.numel() / 4}, x.options().dtype(torch::kInt32));
+
+    constexpr int threads = 256;
+    const int64_t groups = x.numel() / 4;
+    const int blocks = static_cast<int>((groups + threads - 1) / threads);
+
+    symmetric_quantize_pack_per_row_kernel<<<blocks, threads, 0, stream>>>(
+        x.data_ptr<float>(), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel(), static_cast<int>(k_padded)
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// 4. LEGACY ФУНКЦИИ
 __global__ void dp4a_mm_tiled_int32_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -233,7 +346,6 @@ __global__ void dp4a_mm_tiled_int32_kernel(
         __syncthreads();
     }
 
-    // ЧЕСТНАЯ ЗАПИСЬ INT32 БЕЗ ПРОМЕЖУТОЧНОГО FLOAT32
     #pragma unroll
     for (int r = 0; r < 8; ++r) {
         #pragma unroll
@@ -247,118 +359,6 @@ __global__ void dp4a_mm_tiled_int32_kernel(
     }
 }
 
-// 4. СИММЕТРИЧНЫЙ КВАНТОВАТЕЛЬ
-__global__ void symmetric_quantize_pack_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ scale_ptr,
-    int32_t* __restrict__ packed,
-    int64_t count) {
-    const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const int64_t base = group * 4;
-    if (base >= count) return;
-    const float inv_scale = 1.0f / fmaxf(*scale_ptr, 1.0e-12f);
-    uint32_t word = 0;
-    #pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        const int64_t i = base + j;
-        int32_t q = 0;
-        if (i < count) {
-            q = static_cast<int32_t>(nearbyintf(x[i] * inv_scale));
-            q = q < -127 ? -127 : (q > 127 ? 127 : q);
-        }
-        word |= (static_cast<uint32_t>(q) & 0xffu) << (8 * j);
-    }
-    packed[group] = static_cast<int32_t>(word);
-}
-
-// =========================================================================
-// ОБЁРТКИ C++ С ПОЛНОЙ ВАЛИДАЦИЕЙ АРГУМЕНТОВ (TORCH_CHECK)
-// =========================================================================
-
-torch::Tensor dp4a_linear_fused_forward(
-    torch::Tensor a_packed,
-    torch::Tensor bt_packed,
-    torch::Tensor weight_scales,
-    c10::optional<torch::Tensor> bias,
-    torch::Tensor a_scale_tensor,
-    int64_t m, int64_t n, int64_t k4) 
-{
-    TORCH_CHECK(a_packed.is_cuda() && bt_packed.is_cuda(), "Inputs must be CUDA tensors");
-    TORCH_CHECK(a_packed.scalar_type() == torch::kInt32 && bt_packed.scalar_type() == torch::kInt32, "Packed inputs must be int32");
-    TORCH_CHECK(weight_scales.is_cuda() && weight_scales.scalar_type() == torch::kFloat32, "weight_scales must be float32 CUDA tensor");
-    TORCH_CHECK(a_scale_tensor.is_cuda() && a_scale_tensor.scalar_type() == torch::kFloat32 && a_scale_tensor.numel() == 1, "a_scale must be scalar float32 CUDA tensor");
-    TORCH_CHECK(a_packed.is_contiguous() && bt_packed.is_contiguous() && weight_scales.is_contiguous(), "Inputs must be contiguous");
-    TORCH_CHECK(a_packed.device() == bt_packed.device() && a_packed.device() == weight_scales.device(), "Device mismatch");
-    TORCH_CHECK(a_packed.size(0) == m && a_packed.size(1) == k4, "A packed shape mismatch");
-    TORCH_CHECK(bt_packed.size(0) == n && bt_packed.size(1) == k4, "B^T packed shape mismatch");
-    TORCH_CHECK(weight_scales.numel() >= n, "weight_scales size must be >= n");
-    TORCH_CHECK(m > 0 && n > 0 && k4 > 0, "Dimensions must be positive");
-    TORCH_CHECK(k4 % 16 == 0, "k4 must be divisible by 16");
-
-    const float* bias_ptr = nullptr;
-    if (bias.has_value() && bias->defined()) {
-        TORCH_CHECK(bias->is_cuda() && bias->device() == a_packed.device(), "bias device mismatch");
-        TORCH_CHECK(bias->scalar_type() == torch::kFloat32 && bias->is_contiguous(), "bias must be contiguous float32");
-        TORCH_CHECK(bias->numel() >= n, "bias size must be >= n (padded width)");
-        bias_ptr = bias->data_ptr<float>();
-    }
-
-    c10::cuda::CUDAGuard device_guard(a_packed.device());
-    auto stream = c10::cuda::getCurrentCUDAStream(a_packed.get_device());
-    auto out = torch::empty({m, n}, a_packed.options().dtype(torch::kFloat32));
-
-    if (m == 1) {
-        dim3 block(256);
-        dim3 grid((n + 3) / 4);
-        dp4a_gemv_fused_kernel<<<grid, block, 0, stream>>>(
-            a_packed.data_ptr<int32_t>(),
-            bt_packed.data_ptr<int32_t>(),
-            out.data_ptr<float>(),
-            weight_scales.data_ptr<float>(),
-            bias_ptr,
-            a_scale_tensor.data_ptr<float>(),
-            static_cast<int>(n), static_cast<int>(k4)
-        );
-    } else {
-        dim3 block(16, 16);
-        dim3 grid((n + 63) / 64, (m + 127) / 128);
-        dp4a_mm_tiled_fused_kernel<<<grid, block, 0, stream>>>(
-            a_packed.data_ptr<int32_t>(),
-            bt_packed.data_ptr<int32_t>(),
-            out.data_ptr<float>(),
-            weight_scales.data_ptr<float>(),
-            bias_ptr,
-            a_scale_tensor.data_ptr<float>(),
-            static_cast<int>(m), static_cast<int>(n), static_cast<int>(k4)
-        );
-    }
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
-}
-
-torch::Tensor quantize_pack_symmetric_gpu(torch::Tensor x, torch::Tensor scale_tensor) {
-    TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be contiguous GPU tensor");
-    TORCH_CHECK(x.scalar_type() == torch::kFloat32, "x must be float32");
-    TORCH_CHECK(scale_tensor.is_cuda() && scale_tensor.scalar_type() == torch::kFloat32 && scale_tensor.numel() == 1, "scale must be scalar CUDA float32");
-    if (x.numel() == 0) return torch::empty({0}, x.options().dtype(torch::kInt32));
-    TORCH_CHECK(x.numel() % 4 == 0, "x.numel() must be divisible by 4");
-
-    c10::cuda::CUDAGuard device_guard(x.device());
-    auto stream = c10::cuda::getCurrentCUDAStream(x.get_device());
-    auto out = torch::empty({x.numel() / 4}, x.options().dtype(torch::kInt32));
-
-    constexpr int threads = 256;
-    const int64_t groups = x.numel() / 4;
-    const int blocks = static_cast<int>((groups + threads - 1) / threads);
-
-    symmetric_quantize_pack_kernel<<<blocks, threads, 0, stream>>>(
-        x.data_ptr<float>(), scale_tensor.data_ptr<float>(), out.data_ptr<int32_t>(), x.numel()
-    );
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    return out;
-}
-
-// 5. LEGACY ФУНКЦИИ
 __global__ void dp4a_mm_naive_kernel(
     const int32_t* __restrict__ a,
     const int32_t* __restrict__ bt,
@@ -413,7 +413,6 @@ torch::Tensor dp4a_mm_naive(torch::Tensor a, torch::Tensor bt, int64_t m, int64_
 torch::Tensor dp4a_mm_tiled(torch::Tensor a, torch::Tensor bt, int64_t m, int64_t n, int64_t k4) {
     c10::cuda::CUDAGuard device_guard(a.device());
     auto stream = c10::cuda::getCurrentCUDAStream(a.get_device());
-    // НАСТОЯЩИЙ ЧИСТЫЙ INT32 БЕЗ ПРОМЕЖУТОЧНОГО FLOAT32
     auto out = torch::empty({m, n}, a.options().dtype(torch::kInt32));
     dim3 block(16, 16);
     dim3 grid((n + 63) / 64, (m + 127) / 128);
