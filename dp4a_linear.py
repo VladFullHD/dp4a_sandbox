@@ -1,4 +1,4 @@
-"""Production-grade DP4ALinear with native FP16/BF16/FP32 zero-copy input packing."""
+"""Production-grade DP4ALinear with native FP16/BF16/FP32 zero-copy input packing and _apply protection."""
 import copy
 import torch
 import torch.nn as nn
@@ -46,10 +46,18 @@ class DP4ALinear(nn.Module):
             self.bias = None
 
     def _apply(self, fn):
-        """Защита от model.half(): weight_scale всегда обязан оставаться float32!"""
+        """
+        БРОНЕБОЙНАЯ ЗАЩИТА:
+        Позволяет перемещать слой между GPU/CPU, но блокирует попытки
+        привести служебные буферы к float16 при вызове model.half()!
+        """
         super()._apply(fn)
         if hasattr(self, "weight_scale") and self.weight_scale is not None:
-            self.weight_scale = self.weight_scale.to(torch.float32)
+            self.weight_scale = self.weight_scale.to(dtype=torch.float32)
+        if hasattr(self, "bias") and self.bias is not None:
+            self.bias = self.bias.to(dtype=torch.float32)
+        if hasattr(self, "weight_packed") and self.weight_packed is not None:
+            self.weight_packed = self.weight_packed.to(dtype=torch.int32)
         return self
 
     def __deepcopy__(self, memo):
@@ -78,7 +86,7 @@ class DP4ALinear(nn.Module):
         orig_shape = x.shape
         x_dtype = x.dtype
 
-        # НИКАКОГО .float()! Сохраняем исходный dtype (float16/bfloat16/float32) без копирования!
+        # Сохраняем исходный dtype входа (float16/bfloat16/float32)
         x_2d = x.reshape(-1, self.in_features).contiguous()
         M, K = x_2d.shape
 
@@ -89,18 +97,8 @@ class DP4ALinear(nn.Module):
 
         M_real, K_padded = x_padded.shape
 
-        # Построчный масштаб (считается во float32 для точности, но сам x_padded НЕ конвертируется)
+        # Построчный масштаб (активации не дублируются во float32)
         a_scale_per_row = (x_padded.abs().amax(dim=1).float() / 127.0).clamp_min(1e-12).contiguous()
 
-        # Быстрая C++ упаковка читает x_padded напрямую в его нативном типе (half/float)
-        a_packed_1d = self._ext_ref.quantize_pack_symmetric(x_padded, a_scale_per_row, K_padded)
-        a_packed = a_packed_1d.view(M_real, K_padded // 4)
-
-        # Fused GEMM
-        y = self._ext_ref.fused_forward(
-            a_packed, self.weight_packed, self.weight_scale,
-            self.bias, a_scale_per_row,
-            M_real, self.out_features, K_padded // 4
-        )
-
-        return y.reshape(*orig_shape[:-1], self.out_features).to(dtype=x_dtype)
+        # Быстрая C++ упаковка читает вход напрямую в его нативном типе
+        a_pac
