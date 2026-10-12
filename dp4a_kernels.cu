@@ -161,7 +161,7 @@ __global__ void dp4a_mm_tiled_fused_kernel(
     }
 }
 
-// 3. ШАБЛОННЫЙ КВАНТОВАТЕЛЬ С АППАРАТНОЙ ФИЛЬТРАЦИЕЙ INF И NAN
+// 3. ШАБЛОННЫЙ КВАНТОВАТЕЛЬ
 template <typename scalar_t>
 __global__ void symmetric_quantize_pack_per_row_kernel(
     const scalar_t* __restrict__ x,
@@ -184,12 +184,10 @@ __global__ void symmetric_quantize_pack_per_row_kernel(
         int32_t q = 0;
         if (i < count) {
             float val = static_cast<float>(x[i]);
-            
-            // НУЛЕВАЯ СТОИМОСТЬ: Фильтрация NaN и Inf прямо в регистре!
             if (isnan(val)) {
                 val = 0.0f;
             } else if (isinf(val)) {
-                val = (val > 0.0f) ? 65504.0f : -65504.0f; // Ограничение потолком FP16
+                val = (val > 0.0f) ? 65504.0f : -65504.0f;
             }
 
             q = static_cast<int32_t>(nearbyintf(val * inv_scale));
@@ -260,7 +258,6 @@ torch::Tensor dp4a_linear_fused_forward(
     return out;
 }
 
-// Быстрая упаковка C++ (принимает float32, float16 и bfloat16)
 torch::Tensor quantize_pack_symmetric_per_row_gpu(torch::Tensor x, torch::Tensor scale_tensor, int64_t k_padded) {
     TORCH_CHECK(x.is_cuda() && x.is_contiguous(), "x must be contiguous GPU tensor");
     TORCH_CHECK(scale_tensor.is_cuda() && scale_tensor.scalar_type() == torch::kFloat32, "scale must be CUDA float32");
@@ -399,7 +396,7 @@ __global__ void affine_quantize_pack_kernel(
     const float* __restrict__ scale_ptr,
     const int32_t* __restrict__ zp_ptr,
     int32_t* __restrict__ packed,
-    int64_count) {
+    int64_t count) { // <--- ЗДЕСЬ ИСПРАВЛЕН ПРОБЕЛ: int64_t count
     const int64_t group = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t base = group * 4;
     if (base >= count) return;
